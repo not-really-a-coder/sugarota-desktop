@@ -1,0 +1,28 @@
+# Compiler and Build outputs
+bin/
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# Packaging and distributables
+dist/
+
+# Supplementary assets & web previews
+extras/
+
+# Configuration and user data
+config.json
+*.log
+
+# IDE & Editor files
+.vscode/
+.vs/
+.idea/
+*.suo
+*.user
+
+# Operating System files
+Thumbs.db
+Desktop.ini
+.DS_Store
