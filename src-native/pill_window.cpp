@@ -321,10 +321,10 @@ void PillWindow::OnPaint() {
     }
 
     // Mini Chart Preview in the right empty area of the pill
-    // User requested: decrease width by 1px from the left side (add +3.0f to miniLeft)
+    // User requested: decrease width by 10px from the left side
     float arrowRightEdge = arrowCx + (isDouble ? 3.2f : 0.0f) + 2.0f;
     float miniMargin = 7.0f;
-    float miniLeft = arrowRightEdge + miniMargin + 3.0f;
+    float miniLeft = arrowRightEdge + miniMargin + 13.0f;
     float miniRight = size.width - miniMargin;
     float miniTop = 7.0f;
     float miniBottom = size.height - 7.0f;
@@ -383,7 +383,7 @@ void PillWindow::OnPaint() {
             miniCorridorBrush->Release();
         }
 
-        // Color-coded smoothed line
+        // Color-coded line with proportional time scaling over the 1-hour window
         D2D1_COLOR_F greenColor = isDay ? D2D1::ColorF(0.0f, 0.60f, 0.20f) : D2D1::ColorF(0.0f, 1.0f, 0.26f);
         D2D1_COLOR_F orangeColor = isDay ? D2D1::ColorF(0.85f, 0.46f, 0.0f) : D2D1::ColorF(1.0f, 0.60f, 0.0f);
 
@@ -392,11 +392,29 @@ void PillWindow::OnPaint() {
         m_renderTarget->CreateSolidColorBrush(greenColor, &greenBrush);
         m_renderTarget->CreateSolidColorBrush(orangeColor, &orangeBrush);
 
-        float stepX = miniW / (float)(miniPts.size() - 1);
+        long long miniEndTime = miniPts.back().date;
+        long long miniStartTime = miniEndTime - (60LL * 60LL * 1000LL); // 1 hour window
+        long long miniDuration = miniEndTime - miniStartTime;
+        if (miniDuration <= 0) miniDuration = 1;
+
+        auto getMiniX = [&](long long dateMs) -> float {
+            if (dateMs <= miniStartTime) return miniLeft;
+            if (dateMs >= miniEndTime) return miniRight;
+            float norm = (float)(dateMs - miniStartTime) / (float)miniDuration;
+            return miniLeft + (norm * miniW);
+        };
+
+        const long long maxMiniConnectGapMs = 6LL * 60LL * 1000LL;
+
         for (size_t i = 0; i + 1 < miniPts.size(); ++i) {
-            float x1 = miniLeft + (float)i * stepX;
+            long long gap = miniPts[i + 1].date - miniPts[i].date;
+            if (gap > maxMiniConnectGapMs) {
+                continue; // Skip connecting points if gap > 6 min
+            }
+
+            float x1 = getMiniX(miniPts[i].date);
             float y1 = getMiniY(miniPts[i].sgv);
-            float x2 = miniLeft + (float)(i + 1) * stepX;
+            float x2 = getMiniX(miniPts[i + 1].date);
             float y2 = getMiniY(miniPts[i + 1].sgv);
 
             bool bothInside = (miniPts[i].sgv >= m_config.alarmLow && miniPts[i].sgv <= m_config.alarmHigh) &&

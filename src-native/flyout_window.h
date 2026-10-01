@@ -9,7 +9,7 @@
 
 class FlyoutWindow {
 public:
-    FlyoutWindow(D2DContext* d2d, std::function<void()> onSettingsClick = nullptr);
+    FlyoutWindow(D2DContext* d2d, std::function<void()> onSettingsClick = nullptr, std::function<void()> onRefreshClick = nullptr);
     ~FlyoutWindow();
 
     bool Create();
@@ -17,6 +17,8 @@ public:
     void Hide();
     bool IsVisible() const;
     void UpdateData(const std::vector<GlucoseEntry>& entries, const AppConfig& config);
+    void SetRefreshing(bool refreshing);
+    void TriggerRefreshAnimation();
     HWND Hwnd() const { return m_hwnd; }
 
 private:
@@ -39,5 +41,13 @@ private:
     // Pin state (always on top, does not hide on deactivation)
     bool m_isPinned = false;
 
+    // Refresh state & spin animation
+    bool m_isRefreshing = false;
+    float m_refreshAngle = 0.0f;
+    bool m_animatingRefresh = false;
+    ULONGLONG m_lastAnimTick = 0;
+    ULONGLONG m_animStartTick = 0;
+
     std::function<void()> m_onSettingsClick;
+    std::function<void()> m_onRefreshClick;
 };

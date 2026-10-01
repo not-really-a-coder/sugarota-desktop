@@ -2,9 +2,10 @@
 #include <iomanip>
 #include <sstream>
 #include <algorithm>
+#include <chrono>
 
-FlyoutWindow::FlyoutWindow(D2DContext* d2d, std::function<void()> onSettingsClick)
-    : m_d2d(d2d), m_onSettingsClick(onSettingsClick) {}
+FlyoutWindow::FlyoutWindow(D2DContext* d2d, std::function<void()> onSettingsClick, std::function<void()> onRefreshClick)
+    : m_d2d(d2d), m_onSettingsClick(onSettingsClick), m_onRefreshClick(onRefreshClick) {}
 
 FlyoutWindow::~FlyoutWindow() {
     if (m_renderTarget) m_renderTarget->Release();
@@ -13,6 +14,28 @@ FlyoutWindow::~FlyoutWindow() {
 
 bool FlyoutWindow::IsVisible() const {
     return m_hwnd && IsWindowVisible(m_hwnd);
+}
+
+void FlyoutWindow::TriggerRefreshAnimation() {
+    m_animatingRefresh = true;
+    m_animStartTick = GetTickCount64();
+    m_lastAnimTick = m_animStartTick;
+    if (m_hwnd) {
+        SetTimer(m_hwnd, 1001, 16, NULL); // ~60 FPS
+        InvalidateRect(m_hwnd, NULL, FALSE);
+    }
+}
+
+void FlyoutWindow::SetRefreshing(bool refreshing) {
+    m_isRefreshing = refreshing;
+    if (refreshing) {
+        TriggerRefreshAnimation();
+    } else {
+        // Do not immediately kill timer if animating; let WM_TIMER finish at least 1-2 complete cycles
+        if (m_hwnd) {
+            InvalidateRect(m_hwnd, NULL, FALSE);
+        }
+    }
 }
 
 bool FlyoutWindow::Create() {
@@ -210,13 +233,33 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
         return orangeBrush;
     };
 
-    float stepX = (pts.size() > 1) ? (w / (float)(pts.size() - 1)) : w;
+    // Draw Line Segments & Points colored by target range:
+    // Proportional time scaling: 3-hour window ending at latest reading timestamp
+    long long endTime = pts.back().date;
+    long long startTime = endTime - (3LL * 60LL * 60LL * 1000LL); // 3 hours window
+    long long totalDuration = endTime - startTime;
+    if (totalDuration <= 0) totalDuration = 1;
+
+    auto getX = [&](long long dateMs) -> float {
+        if (dateMs <= startTime) return chartX0;
+        if (dateMs >= endTime) return chartX1;
+        float norm = (float)(dateMs - startTime) / (float)totalDuration;
+        return chartX0 + (norm * w);
+    };
 
     // Draw line segments between adjacent points
+    // If the gap between points is more than 6 minutes (360,000 ms), do NOT connect them!
+    const long long maxConnectGapMs = 6LL * 60LL * 1000LL;
+
     for (size_t i = 0; i + 1 < pts.size(); ++i) {
-        float x1 = chartX0 + (float)i * stepX;
+        long long gap = pts[i + 1].date - pts[i].date;
+        if (gap > maxConnectGapMs) {
+            continue; // Skip drawing line across gap > 6 min
+        }
+
+        float x1 = getX(pts[i].date);
         float y1 = getY(pts[i].sgv);
-        float x2 = chartX0 + (float)(i + 1) * stepX;
+        float x2 = getX(pts[i + 1].date);
         float y2 = getY(pts[i + 1].sgv);
 
         // Segment color: if either point is outside target range, color orange; if both inside, green
@@ -230,7 +273,7 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
 
     // Draw point dots
     for (size_t i = 0; i < pts.size(); ++i) {
-        float px = chartX0 + (float)i * stepX;
+        float px = getX(pts[i].date);
         float py = getY(pts[i].sgv);
         ID2D1SolidColorBrush* dotBrush = getBrushForSgv(pts[i].sgv);
         if (dotBrush) {
@@ -240,7 +283,7 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
 
     // Highlight latest reading
     if (!pts.empty()) {
-        float lastX = chartX0 + (float)(pts.size() - 1) * stepX;
+        float lastX = getX(pts.back().date);
         float lastY = getY(pts.back().sgv);
         ID2D1SolidColorBrush* lastBrush = getBrushForSgv(pts.back().sgv);
         if (lastBrush) {
@@ -250,11 +293,11 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
 
     // Interactive Scrubber Tooltip
     if (m_hoveringChart && !pts.empty()) {
-        // Find closest data point to m_mouseChartX
+        // Find closest data point to m_mouseChartX using proportional coordinates
         size_t bestIdx = 0;
         float bestDiff = 999999.0f;
         for (size_t i = 0; i < pts.size(); ++i) {
-            float px = chartX0 + (float)i * stepX;
+            float px = getX(pts[i].date);
             float diff = fabsf(m_mouseChartX - px);
             if (diff < bestDiff) {
                 bestDiff = diff;
@@ -262,7 +305,7 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
             }
         }
 
-        float ptX = chartX0 + (float)bestIdx * stepX;
+        float ptX = getX(pts[bestIdx].date);
         float ptY = getY(pts[bestIdx].sgv);
 
         // Draw vertical hairline scrubber
@@ -359,25 +402,22 @@ void FlyoutWindow::DrawChart(ID2D1RenderTarget* target, const D2D1_RECT_F& r, bo
             return std::wstring(buf);
         };
 
-        // Draw oldest time on left
+        // Draw oldest time (3 hours ago) on left
         axisFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        std::wstring tStart = formatTime(pts.front().date);
+        std::wstring tStart = formatTime(startTime);
         target->DrawText(tStart.c_str(), (UINT32)tStart.length(), axisFormat,
                          D2D1::RectF(chartX0, chartY1 + 3.0f, chartX0 + 60.0f, chartY1 + 17.0f), labelBrush);
 
-        // Draw midpoint time if available
-        if (pts.size() >= 3) {
-            axisFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-            size_t midIdx = pts.size() / 2;
-            std::wstring tMid = formatTime(pts[midIdx].date);
-            float midX = chartX0 + (w / 2.0f);
-            target->DrawText(tMid.c_str(), (UINT32)tMid.length(), axisFormat,
-                             D2D1::RectF(midX - 30.0f, chartY1 + 3.0f, midX + 30.0f, chartY1 + 17.0f), labelBrush);
-        }
+        // Draw midpoint time (1.5 hours ago) in middle
+        axisFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        std::wstring tMid = formatTime(startTime + (totalDuration / 2LL));
+        float midX = chartX0 + (w / 2.0f);
+        target->DrawText(tMid.c_str(), (UINT32)tMid.length(), axisFormat,
+                         D2D1::RectF(midX - 30.0f, chartY1 + 3.0f, midX + 30.0f, chartY1 + 17.0f), labelBrush);
 
         // Draw latest time on right
         axisFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-        std::wstring tEnd = formatTime(pts.back().date);
+        std::wstring tEnd = formatTime(endTime);
         target->DrawText(tEnd.c_str(), (UINT32)tEnd.length(), axisFormat,
                          D2D1::RectF(chartX1 - 60.0f, chartY1 + 3.0f, chartX1, chartY1 + 17.0f), labelBrush);
     }
@@ -419,6 +459,7 @@ void FlyoutWindow::OnPaint() {
     IDWriteTextFormat* unitFormat = nullptr;
     IDWriteTextFormat* deltaFormat = nullptr;
     IDWriteTextFormat* statsFormat = nullptr;
+    IDWriteTextFormat* syncFormat = nullptr;
 
     m_d2d->DWriteFactory()->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.5f, L"en-us", &titleFormat);
     m_d2d->DWriteFactory()->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BLACK, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 36.0f, L"en-us", &heroFormat);
@@ -427,6 +468,7 @@ void FlyoutWindow::OnPaint() {
     // Delta format (12pt medium)
     m_d2d->DWriteFactory()->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.0f, L"en-us", &deltaFormat);
     m_d2d->DWriteFactory()->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-us", &statsFormat);
+    m_d2d->DWriteFactory()->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 10.0f, L"en-us", &syncFormat);
 
     ID2D1SolidColorBrush* textBrush = nullptr;
     m_renderTarget->CreateSolidColorBrush(isDay ? D2D1::ColorF(0.1f, 0.1f, 0.1f) : D2D1::ColorF(1.0f, 1.0f, 1.0f), &textBrush);
@@ -436,20 +478,105 @@ void FlyoutWindow::OnPaint() {
 
     if (textBrush && titleFormat) {
         std::wstring header = L"NIGHTSCOUT LIVE";
-        m_renderTarget->DrawText(header.c_str(), (UINT32)header.length(), titleFormat, D2D1::RectF(16.0f, 12.0f, size.width - 65.0f, 26.0f), mutedBrush);
+        m_renderTarget->DrawText(header.c_str(), (UINT32)header.length(), titleFormat, D2D1::RectF(16.0f, 12.0f, size.width - 90.0f, 26.0f), mutedBrush);
     }
 
-    // Settings (Gear) icon in top-right area (cx: size.width - 44.0f, cy: 18.0f)
+    // Header Action Icons: Refresh, Settings, Pin
+    // 1. Force data refresh icon (cx: size.width - 66.0f, cy: 18.0f)
+    // Classical circular clockwise arrow with animated rotation on click
     {
-        float gearCx = size.width - 44.0f;
+        float refCx = size.width - 66.0f;
+        float refCy = 18.0f;
+        D2D1_COLOR_F refColor = (m_isRefreshing || m_animatingRefresh)
+            ? (isDay ? D2D1::ColorF(0.0f, 0.45f, 0.85f) : D2D1::ColorF(0.20f, 0.65f, 1.0f))
+            : (isDay ? D2D1::ColorF(0.50f, 0.50f, 0.50f) : D2D1::ColorF(0.60f, 0.60f, 0.60f));
+        ID2D1SolidColorBrush* refBrush = nullptr;
+        m_renderTarget->CreateSolidColorBrush(refColor, &refBrush);
+        if (refBrush) {
+            D2D1_MATRIX_3X2_F oldTrans;
+            m_renderTarget->GetTransform(&oldTrans);
+            D2D1_MATRIX_3X2_F rot = D2D1::Matrix3x2F::Rotation(m_refreshAngle, D2D1::Point2F(refCx, refCy));
+            m_renderTarget->SetTransform(rot * oldTrans);
+
+            // Circular open arc matching reference image:
+            // Arc starts at roughly +25° (middle-right) and sweeps CLOCKWISE down around to ~285° (-75°, near top)
+            // leaving a gap in the upper-right quadrant where the arrowhead emerges.
+            float r = 5.8f;
+            float startAngleDeg = 25.0f;
+            float endAngleDeg = -75.0f; // 285 degrees (top-right area)
+            float startRad = startAngleDeg * 3.14159265f / 180.0f;
+            float endRad = endAngleDeg * 3.14159265f / 180.0f;
+
+            ID2D1PathGeometry* arcGeo = nullptr;
+            m_d2d->Factory()->CreatePathGeometry(&arcGeo);
+            if (arcGeo) {
+                ID2D1GeometrySink* sink = nullptr;
+                if (SUCCEEDED(arcGeo->Open(&sink))) {
+                    sink->BeginFigure(D2D1::Point2F(refCx + cosf(startRad) * r, refCy + sinf(startRad) * r), D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink->AddArc(D2D1::ArcSegment(
+                        D2D1::Point2F(refCx + cosf(endRad) * r, refCy + sinf(endRad) * r),
+                        D2D1::SizeF(r, r), 0.0f, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_LARGE
+                    ));
+                    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+                    sink->Close();
+                    sink->Release();
+
+                    ID2D1StrokeStyle* strokeStyle = nullptr;
+                    m_d2d->Factory()->CreateStrokeStyle(
+                        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
+                        nullptr, 0, &strokeStyle
+                    );
+                    m_renderTarget->DrawGeometry(arcGeo, refBrush, 2.0f, strokeStyle);
+                    if (strokeStyle) strokeStyle->Release();
+                }
+                arcGeo->Release();
+            }
+
+            // Arrowhead at the tip of the arc:
+            // At angle endAngleDeg (-75°), the clockwise tangent (forward direction) points in screen coords at
+            // angle (-75° + 90°) = +15° in math coords, which is (dx > 0, dy < 0): pointing UP and RIGHT (~45° up-right in screen coords).
+            // Let the arrow tip be at (tipX, tipY) extended slightly along the forward direction:
+            float fwdAngle = endRad + (3.14159265f / 2.0f); // forward direction of clockwise movement
+            float tipX = refCx + cosf(endRad) * r + cosf(fwdAngle) * 1.5f;
+            float tipY = refCy + sinf(endRad) * r + sinf(fwdAngle) * 1.5f;
+            float barbLen = 4.2f;
+
+            // Barbs extend backward from the tip (fwdAngle + PI) spread by +/- 40 degrees:
+            float backwardAngle = fwdAngle + 3.14159265f;
+            float leftWingAngle = backwardAngle - 0.70f;
+            float rightWingAngle = backwardAngle + 0.70f;
+
+            ID2D1StrokeStyle* capStyle = nullptr;
+            m_d2d->Factory()->CreateStrokeStyle(
+                D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
+                nullptr, 0, &capStyle
+            );
+            m_renderTarget->DrawLine(
+                D2D1::Point2F(tipX, tipY),
+                D2D1::Point2F(tipX + cosf(leftWingAngle) * barbLen, tipY + sinf(leftWingAngle) * barbLen),
+                refBrush, 2.0f, capStyle
+            );
+            m_renderTarget->DrawLine(
+                D2D1::Point2F(tipX, tipY),
+                D2D1::Point2F(tipX + cosf(rightWingAngle) * barbLen, tipY + sinf(rightWingAngle) * barbLen),
+                refBrush, 2.0f, capStyle
+            );
+            if (capStyle) capStyle->Release();
+
+            m_renderTarget->SetTransform(oldTrans);
+            refBrush->Release();
+        }
+    }
+
+    // 2. Settings (Gear) icon (cx: size.width - 42.0f, cy: 18.0f)
+    {
+        float gearCx = size.width - 42.0f;
         float gearCy = 18.0f;
         D2D1_COLOR_F gearColor = isDay ? D2D1::ColorF(0.55f, 0.55f, 0.55f) : D2D1::ColorF(0.55f, 0.55f, 0.55f);
         ID2D1SolidColorBrush* gearBrush = nullptr;
         m_renderTarget->CreateSolidColorBrush(gearColor, &gearBrush);
         if (gearBrush) {
-            // Draw central hub
             m_renderTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(gearCx, gearCy), 4.5f, 4.5f), gearBrush, 1.5f);
-            // Draw 6 cog spokes
             for (int i = 0; i < 6; ++i) {
                 float rad = (float)i * (3.14159265f / 3.0f);
                 float x1 = gearCx + cosf(rad) * 3.5f;
@@ -462,7 +589,7 @@ void FlyoutWindow::OnPaint() {
         }
     }
 
-    // Pin icon in top-right corner (cx: size.width - 18.0f, cy: 18.0f)
+    // 3. Pin icon (cx: size.width - 18.0f, cy: 18.0f)
     {
         float pinCx = size.width - 18.0f;
         float pinCy = 18.0f;
@@ -473,15 +600,11 @@ void FlyoutWindow::OnPaint() {
         ID2D1SolidColorBrush* pinBrush = nullptr;
         m_renderTarget->CreateSolidColorBrush(pinColor, &pinBrush);
         if (pinBrush) {
-            // Draw pushpin symbol
-            // Pin head/body
             m_renderTarget->DrawLine(D2D1::Point2F(pinCx - 3.5f, pinCy - 4.0f), D2D1::Point2F(pinCx + 3.5f, pinCy - 4.0f), pinBrush, 1.8f);
             m_renderTarget->DrawLine(D2D1::Point2F(pinCx, pinCy - 4.0f), D2D1::Point2F(pinCx, pinCy + 1.0f), pinBrush, 2.2f);
             m_renderTarget->DrawLine(D2D1::Point2F(pinCx - 5.0f, pinCy + 1.0f), D2D1::Point2F(pinCx + 5.0f, pinCy + 1.0f), pinBrush, 1.8f);
-            // Pin needle
             m_renderTarget->DrawLine(D2D1::Point2F(pinCx, pinCy + 1.0f), D2D1::Point2F(pinCx, pinCy + 6.0f), pinBrush, 1.5f);
 
-            // If pinned, draw an indicator circle around it
             if (m_isPinned) {
                 m_renderTarget->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(pinCx, pinCy), 9.0f, 9.0f), pinBrush, 1.2f);
             }
@@ -492,6 +615,7 @@ void FlyoutWindow::OnPaint() {
     // Big Glucose Hero
     double currentSgv = m_entries.empty() ? 0.0 : m_entries[0].sgv;
     std::string direction = m_entries.empty() ? "Flat" : m_entries[0].direction;
+    long long lastDate = m_entries.empty() ? 0 : m_entries[0].date;
     bool isMmol = (m_config.unit == L"mmol");
 
     std::wstringstream heroStream;
@@ -518,7 +642,7 @@ void FlyoutWindow::OnPaint() {
         }
     }
 
-    // Draw Hero number
+    // Draw Hero number - y=28.0f
     if (heroBrush) {
         if (heroLayout) {
             m_renderTarget->DrawTextLayout(D2D1::Point2F(16.0f, 28.0f), heroLayout, heroBrush);
@@ -528,19 +652,18 @@ void FlyoutWindow::OnPaint() {
         }
     }
 
-    // Trend Arrow between glucose value and delta/units:
-    // Centered at cy=55.0f
-    float arrowCx = 16.0f + heroWidth + 18.0f;
+    // Trend Arrow:
+    float arrowCx = 16.0f + heroWidth + 24.0f;
     float arrowCy = 55.0f;
     if (heroBrush) {
-        D2DContext::DrawTrendArrow(m_renderTarget, heroBrush, direction, arrowCx, arrowCy, 33.0f, 3.5f);
+        D2DContext::DrawTrendArrow(m_renderTarget, heroBrush, direction, arrowCx, arrowCy, 26.4f, 2.8f);
         heroBrush->Release();
     }
 
-    // Delta & Units block (switched order: line 1 = delta, line 2 = units)
-    float unitLeft = arrowCx + 20.0f;
+    // Delta & Units block
+    float unitLeft = arrowCx + 24.0f;
 
-    // Line 1: Delta label with triangle symbol - moved 1px down to y=39 (y = 39 to 56)
+    // Line 1: Delta label with triangle symbol - at y=39
     std::wstringstream deltaStream;
     deltaStream << L"\x0394 ";
     if (!m_entries.empty()) {
@@ -557,15 +680,48 @@ void FlyoutWindow::OnPaint() {
                                  D2D1::RectF(unitLeft, 39.0f, size.width - 16.0f, 56.0f), mutedBrush);
     }
 
-    // Line 2: Units label - moved 1px up to y=53 (y = 53 to 70)
+    // Line 2: Units label - at y=53
     std::wstring unitStr = isMmol ? L"mmol/L" : L"mg/dL";
     if (textBrush && unitFormat) {
         m_renderTarget->DrawText(unitStr.c_str(), (UINT32)unitStr.length(), unitFormat,
                                  D2D1::RectF(unitLeft, 53.0f, size.width - 16.0f, 70.0f), textBrush);
     }
 
-    // 3-Hour Chart Area (with axis margins for labels) - extends to 286.0f, filling the bottom neatly
-    DrawChart(m_renderTarget, D2D1::RectF(14.0f, 82.0f, size.width - 14.0f, 286.0f), isDay);
+    // "Synced on: HH:MM:SS (X min ago)" / "now" below actual glucose value
+    // Vertical alignment starts at 16.0f
+    if (mutedBrush && syncFormat) {
+        std::wstringstream syncStream;
+        if (lastDate > 0) {
+            time_t t = (time_t)(lastDate / 1000LL);
+            struct tm ltm;
+            localtime_s(&ltm, &t);
+            wchar_t timeBuf[32];
+            swprintf_s(timeBuf, L"%02d:%02d:%02d", ltm.tm_hour, ltm.tm_min, ltm.tm_sec);
+
+            long long nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            long long diffMins = (nowMs >= lastDate) ? ((nowMs - lastDate) / 60000LL) : 0;
+            if (diffMins < 0) diffMins = 0;
+
+            syncStream << L"Synced on: " << timeBuf << L" (";
+            if (diffMins <= 0) {
+                syncStream << L"now";
+            } else {
+                syncStream << diffMins << L" min ago";
+            }
+            syncStream << L")";
+        } else {
+            syncStream << L"Synced on: --";
+        }
+        std::wstring syncStr = syncStream.str();
+        m_renderTarget->DrawText(syncStr.c_str(), (UINT32)syncStr.length(), syncFormat,
+                                 D2D1::RectF(16.0f, 77.0f, size.width - 16.0f, 92.0f), mutedBrush);
+    }
+
+    // 3-Hour Chart Area:
+    // Chart is horizontally aligned with the text above (left: 16.0f, right: size.width - 16.0f)
+    // and vertical spacing cleared (top: 98.0f)
+    DrawChart(m_renderTarget, D2D1::RectF(16.0f, 98.0f, size.width - 16.0f, 286.0f), isDay);
 
     if (textBrush) textBrush->Release();
     if (mutedBrush) mutedBrush->Release();
@@ -574,6 +730,7 @@ void FlyoutWindow::OnPaint() {
     if (unitFormat) unitFormat->Release();
     if (deltaFormat) deltaFormat->Release();
     if (statsFormat) statsFormat->Release();
+    if (syncFormat) syncFormat->Release();
 
     m_renderTarget->EndDraw();
 }
@@ -595,13 +752,47 @@ LRESULT CALLBACK FlyoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         EndPaint(hwnd, &ps);
         return 0;
     }
+    case WM_TIMER: {
+        if (pThis && wParam == 1001) {
+            ULONGLONG now = GetTickCount64();
+            float dt = (pThis->m_lastAnimTick > 0) ? (float)(now - pThis->m_lastAnimTick) / 1000.0f : 0.016f;
+            pThis->m_lastAnimTick = now;
+
+            // Rotate 720 degrees per second
+            pThis->m_refreshAngle += dt * 720.0f;
+            if (pThis->m_refreshAngle >= 360.0f) {
+                pThis->m_refreshAngle = fmodf(pThis->m_refreshAngle, 360.0f);
+            }
+
+            // Ensure animation runs for at least 1000ms so it does not interrupt early
+            bool minDurationPassed = (now - pThis->m_animStartTick) >= 1000;
+            if (!pThis->m_isRefreshing && minDurationPassed) {
+                pThis->m_animatingRefresh = false;
+                pThis->m_refreshAngle = 0.0f;
+                KillTimer(hwnd, 1001);
+            }
+
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+    }
     case WM_LBUTTONDOWN: {
         if (!pThis) break;
         int mouseX = LOWORD(lParam);
         int mouseY = HIWORD(lParam);
 
-        // Check if user clicked the settings gear icon: x in [266, 288], y in [8, 30]
-        if (mouseX >= 266 && mouseX <= 288 && mouseY >= 8 && mouseY <= 30) {
+        // Check if user clicked force data refresh icon: x in [242, 266], y in [8, 30]
+        if (mouseX >= 242 && mouseX <= 266 && mouseY >= 8 && mouseY <= 30) {
+            pThis->TriggerRefreshAnimation();
+            if (pThis->m_onRefreshClick) {
+                pThis->m_onRefreshClick();
+            }
+            return 0;
+        }
+
+        // Check if user clicked the settings gear icon: x in [268, 290], y in [8, 30]
+        if (mouseX >= 268 && mouseX <= 290 && mouseY >= 8 && mouseY <= 30) {
             if (pThis->m_onSettingsClick) {
                 pThis->m_onSettingsClick();
             }
@@ -624,8 +815,8 @@ LRESULT CALLBACK FlyoutWindow::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         int mouseX = LOWORD(lParam);
         int mouseY = HIWORD(lParam);
 
-        // Chart bounds: x in [14, 306], y in [82, 286]
-        if (mouseX >= 14 && mouseX <= 306 && mouseY >= 82 && mouseY <= 286) {
+        // Chart bounds: x in [16, size.width - 16], y in [98, 286]
+        if (mouseX >= 16 && mouseX <= 304 && mouseY >= 98 && mouseY <= 286) {
             pThis->m_hoveringChart = true;
             pThis->m_mouseChartX = (float)mouseX;
         } else {

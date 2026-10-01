@@ -47,9 +47,14 @@ public:
         m_hwnd = CreateWindowExW(0, L"SugarotaManagerClass", L"Sugarota Manager", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, hInst, this);
         if (!m_hwnd) return false;
 
-        m_flyout = std::make_unique<FlyoutWindow>(&m_d2d, [this]() {
-            OpenSettings();
-        });
+        m_flyout = std::make_unique<FlyoutWindow>(
+            &m_d2d,
+            [this]() { OpenSettings(); },
+            [this]() {
+                if (m_flyout) m_flyout->SetRefreshing(true);
+                m_client.FetchNow();
+            }
+        );
         m_flyout->Create();
 
         SetupTrayIcon();
@@ -219,6 +224,9 @@ private:
             if (pThis && pEntries) {
                 pThis->m_latestEntries = *pEntries;
                 delete pEntries;
+                if (pThis->m_flyout) {
+                    pThis->m_flyout->SetRefreshing(false);
+                }
                 pThis->UpdateAllWindows();
             }
             return 0;
